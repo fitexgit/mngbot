@@ -144,6 +144,7 @@ def bot_menu_keyboard(bot_name):
         InlineKeyboardButton(watchdog_text, callback_data=f"watchdog_{bot_name}"),
         InlineKeyboardButton("💾 Backup", callback_data=f"backup_{bot_name}"),
         InlineKeyboardButton("🔑 Variables", callback_data=f"vars_{bot_name}"),
+        InlineKeyboardButton("▶️ Start Cmd", callback_data=f"startcmd_{bot_name}"),
         InlineKeyboardButton("🧹 Clear Log", callback_data=f"clearlog_{bot_name}"),
         InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{bot_name}")
     )
@@ -170,6 +171,25 @@ def get_bots_list():
     if not os.path.exists(BOTS_DIR): os.makedirs(BOTS_DIR)
     return sorted([d for d in os.listdir(BOTS_DIR) if os.path.isdir(os.path.join(BOTS_DIR, d))])
 
+
+
+def get_start_cmd(bot_name):
+    """Custom start command file: one line, e.g. python main.py  or  ./decryptbot"""
+    path = os.path.join(BOTS_DIR, bot_name, "start_cmd.txt")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cmd = f.read().strip()
+                if cmd:
+                    return cmd
+        except:
+            pass
+    return None
+
+def save_start_cmd(bot_name, cmd):
+    path = os.path.join(BOTS_DIR, bot_name, "start_cmd.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cmd.strip())
 
 def get_bot_env(bot_name):
     """Load per-bot environment variables from env.json"""
@@ -260,20 +280,27 @@ def start_bot(bot_name, chat_id, silent=False):
             )
         return False
 
-    # Build command
-    if bot_type == "python":
+    # Build command — custom start_cmd.txt overrides auto-detect
+    custom_cmd = get_start_cmd(bot_name)
+    if custom_cmd:
+        # Support: "python main.py"  /  "python3 bot.py"  /  "./decryptbot"  /  "go run ."
+        parts = custom_cmd.split()
+        if parts[0] in ("python", "python3"):
+            parts[0] = VENV_PYTHON
+        cmd = parts
+        type_label = f"Custom: {custom_cmd}"
+        Logger.info(f"Using custom start command for '{bot_name}': {cmd}")
+    elif bot_type == "python":
         entry = find_python_entry(bot_dir)
         if not entry:
             if not silent:
-                bot.send_message(chat_id, f"❌ No Python entry file found for `{bot_name}`.", parse_mode="Markdown")
+                bot.send_message(chat_id, f"❌ No Python entry file found for `{bot_name}`.\nUse «▶️ Start Cmd» to set e.g. `python main.py`", parse_mode="Markdown")
             return False
         cmd = [VENV_PYTHON, entry]
         type_label = "Python"
     else:  # go
-        # Prefer pre-built binary if present, otherwise `go run .`
         binary = os.path.join(bot_dir, "decryptbot")
         if not os.path.exists(binary):
-            # try any executable binary in root
             for f in os.listdir(bot_dir):
                 fp = os.path.join(bot_dir, f)
                 if os.path.isfile(fp) and os.access(fp, os.X_OK) and not f.endswith((".go", ".mod", ".sum")):
@@ -286,14 +313,13 @@ def start_bot(bot_name, chat_id, silent=False):
             cmd = [binary]
             type_label = "Go (binary)"
         else:
-            # Check if go is available
             go_bin = shutil.which("go")
             if not go_bin:
                 if not silent:
                     bot.send_message(
                         chat_id,
-                        f"❌ Go is not installed on this server and no pre-built binary found for `{bot_name}`.\n"
-                        f"Either install Go or build the binary and upload it.",
+                        f"❌ Go is not installed and no binary found for `{bot_name}`.\n"
+                        f"Set a custom Start Cmd or upload a built binary.",
                         parse_mode="Markdown"
                     )
                 Logger.error(f"Cannot start Go bot '{bot_name}': go not found and no binary")
@@ -675,18 +701,40 @@ def handle_text_input(message):
             start_bot(new_name, chat_id)
 
     elif action == 'install_packages':
-        packages = message.text.strip().split()
+        raw = message.text.strip()
         del user_states[chat_id]
+        # Support both space-separated and requirements-style (pkg==ver)
+        packages = []
+        for line in raw.replace(",", " ").splitlines():
+            for part in line.split():
+                part = part.strip()
+                if part and not part.startswith("#"):
+                    packages.append(part)
         if not packages:
             bot.send_message(chat_id, "No package names entered.", reply_markup=main_menu_keyboard())
             return
-        msg = bot.send_message(chat_id, f"📦 Installing `{len(packages)}` package(s)...", parse_mode="Markdown")
+        msg = bot.send_message(chat_id, f"📦 Installing `{len(packages)}` package(s)...\n`{' '.join(packages[:8])}`" + ("..." if len(packages)>8 else ""), parse_mode="Markdown")
+        Logger.info(f"Installing packages: {packages}")
         try:
-            command = [sys.executable, "-m", "pip", "install"] + packages
-            result = subprocess.check_output(command, stderr=subprocess.STDOUT, text=True, encoding='utf-8')
-            bot.edit_message_text(f"✅ Successfully installed:\n\n```\n{result}\n```", chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+            command = [sys.executable, "-m", "pip", "install", "--upgrade"] + packages
+            result = subprocess.check_output(command, stderr=subprocess.STDOUT, text=True, encoding='utf-8', timeout=300)
+            # Keep only last lines to avoid MESSAGE_TOO_LONG
+            lines = result.strip().splitlines()
+            short = "\n".join(lines[-25:]) if len(lines) > 25 else result.strip()
+            if len(short) > 3500:
+                short = short[-3500:]
+            bot.edit_message_text(
+                f"✅ Successfully installed `{len(packages)}` package(s).\n\n```\n{short}\n```",
+                chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard()
+            )
+            Logger.success(f"Installed packages: {packages}")
+        except subprocess.TimeoutExpired:
+            bot.edit_message_text("❌ Install timed out (5 min). Some packages may be installed.", chat_id, msg.message_id, reply_markup=main_menu_keyboard())
+            Logger.error("Package install timed out")
         except subprocess.CalledProcessError as e:
-            bot.edit_message_text(f"❌ Error installing:\n\n```\n{e.output}\n```", chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+            out = (e.output or str(e))[-3000:]
+            bot.edit_message_text(f"❌ Error installing:\n\n```\n{out}\n```", chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+            Logger.error(f"Package install failed: {out[:200]}")
 
     elif action == 'run_command':
         command = message.text.strip()
@@ -703,6 +751,27 @@ def handle_text_input(message):
         except Exception as e:
             bot.edit_message_text(f"❌ **Error:**\n\n`{e}`", chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
+
+
+    elif action == 'set_start_cmd':
+        bot_name = state['bot_name']
+        del user_states[chat_id]
+        cmd = message.text.strip()
+        if cmd.upper() == "AUTO":
+            path = os.path.join(BOTS_DIR, bot_name, "start_cmd.txt")
+            if os.path.exists(path):
+                os.remove(path)
+            bot.send_message(chat_id, f"✅ Start command cleared. Will auto-detect for `{bot_name}`.", parse_mode="Markdown", reply_markup=bot_menu_keyboard(bot_name))
+            Logger.info(f"Cleared start cmd for '{bot_name}'")
+            return
+        save_start_cmd(bot_name, cmd)
+        bot.send_message(
+            chat_id,
+            f"✅ Start command set for `{bot_name}`:\n`{cmd}`\n\nRestart the bot to apply.",
+            parse_mode="Markdown",
+            reply_markup=bot_menu_keyboard(bot_name)
+        )
+        Logger.success(f"Start cmd for '{bot_name}': {cmd}")
 
     elif action == 'set_bot_vars':
         bot_name = state['bot_name']
@@ -778,6 +847,25 @@ def handle_document(message):
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(extract_path)
         os.remove(zip_path)
+        # If zip had a single top-level folder, move its contents up
+        try:
+            entries = [e for e in os.listdir(extract_path) if e not in ('.', '..')]
+            if len(entries) == 1:
+                only = os.path.join(extract_path, entries[0])
+                if os.path.isdir(only):
+                    for item in os.listdir(only):
+                        src = os.path.join(only, item)
+                        dst = os.path.join(extract_path, item)
+                        if os.path.exists(dst):
+                            if os.path.isdir(dst):
+                                shutil.rmtree(dst)
+                            else:
+                                os.remove(dst)
+                        shutil.move(src, dst)
+                    os.rmdir(only)
+                    Logger.info(f"Flattened nested folder '{entries[0]}' into bot root")
+        except Exception as e:
+            Logger.warning(f"Could not flatten zip structure: {e}")
 
     if action == 'restore_backup':
         if not file_name.lower().endswith('.zip'):
@@ -1087,6 +1175,25 @@ def callback_handler(call):
             keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back", callback_data=f"bot_{param}"))
             bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard, parse_mode="Markdown")
             Logger.info(f"Showing variables for '{param}' to admin {chat_id}")
+
+
+        elif action == "startcmd":
+            current = get_start_cmd(param) or "_auto-detect_"
+            text = (
+                f"▶️ *Start Command for `{param}`*\n\n"
+                f"Current: `{current}`\n\n"
+                f"Send the command to run this bot, examples:\n"
+                f"• `python main.py`\n"
+                f"• `python bot.py`\n"
+                f"• `python -m app`\n"
+                f"• `./decryptbot`\n"
+                f"• `go run .`\n\n"
+                f"Send `AUTO` to clear and use auto-detect."
+            )
+            user_states[chat_id] = {'action': 'set_start_cmd', 'bot_name': param}
+            keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back", callback_data=f"bot_{param}"))
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard, parse_mode="Markdown")
+            Logger.info(f"Start cmd setup for '{param}' by {chat_id}")
 
         elif action == "files":
             list_files(call, param)
