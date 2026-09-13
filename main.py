@@ -194,36 +194,154 @@ def save_bot_env(bot_name, env_dict):
         Logger.error(f"Failed to save env.json for '{bot_name}': {e}")
         return False
 
+def detect_bot_type(bot_dir):
+    """Detect whether a bot is Python or Go based on files present."""
+    if os.path.exists(os.path.join(bot_dir, "go.mod")) or os.path.exists(os.path.join(bot_dir, "main.go")):
+        return "go"
+    for name in ("bot.py", "main.py", "app.py", "run.py"):
+        if os.path.exists(os.path.join(bot_dir, name)):
+            return "python"
+    return None
+
+def find_python_entry(bot_dir):
+    for name in ("bot.py", "main.py", "app.py", "run.py"):
+        p = os.path.join(bot_dir, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+def ensure_data_dir(bot_name, bot_dir, bot_env):
+    """
+    Ensure a persistent data directory exists for the bot and set common
+    path-related environment variables if the user has not overridden them.
+    This makes bots that expect DATA_DIR=/data (or SOURCES_FILE etc.) work
+    correctly when managed as a subprocess.
+    """
+    data_dir = os.path.join(bot_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+
+    # Only auto-set if the user has not already defined them in Variables
+    defaults = {
+        "DATA_DIR": data_dir,
+        "SOURCES_FILE": os.path.join(data_dir, "sources.json"),
+        "STATE_FILE": os.path.join(data_dir, "last_ids.json"),
+        "CREDS_FILE": os.path.join(data_dir, "x_credentials.json"),
+        "DB_PATH": os.path.join(data_dir, "bot.db"),
+    }
+    applied = []
+    for key, value in defaults.items():
+        if key not in bot_env or not str(bot_env.get(key, "")).strip():
+            bot_env[key] = value
+            applied.append(key)
+    if applied:
+        Logger.info(f"Auto-set data paths for '{bot_name}': {applied} → {data_dir}")
+    return data_dir
+
 def start_bot(bot_name, chat_id, silent=False):
     if bot_name in running_bots and running_bots[bot_name]['process'].poll() is None:
-        if not silent: bot.send_message(chat_id, f"⚠️ Bot `{bot_name}` is already running.", parse_mode="Markdown")
+        if not silent:
+            bot.send_message(chat_id, f"⚠️ Bot `{bot_name}` is already running.", parse_mode="Markdown")
         return False
+
     bot_dir = os.path.join(BOTS_DIR, bot_name)
-    bot_script = os.path.join(bot_dir, "bot.py")
-    if not os.path.exists(bot_script):
-        if not silent: bot.send_message(chat_id, f"❌ Error: `bot.py` not found for bot `{bot_name}`.", parse_mode="Markdown")
+    if not os.path.isdir(bot_dir):
+        if not silent:
+            bot.send_message(chat_id, f"❌ Bot folder `{bot_name}` not found.", parse_mode="Markdown")
         return False
+
+    bot_type = detect_bot_type(bot_dir)
+    if bot_type is None:
+        if not silent:
+            bot.send_message(
+                chat_id,
+                f"❌ Cannot detect bot type for `{bot_name}`.\n"
+                f"Need `bot.py` / `main.py` (Python) or `main.go` / `go.mod` (Go).",
+                parse_mode="Markdown"
+            )
+        return False
+
+    # Build command
+    if bot_type == "python":
+        entry = find_python_entry(bot_dir)
+        if not entry:
+            if not silent:
+                bot.send_message(chat_id, f"❌ No Python entry file found for `{bot_name}`.", parse_mode="Markdown")
+            return False
+        cmd = [VENV_PYTHON, entry]
+        type_label = "Python"
+    else:  # go
+        # Prefer pre-built binary if present, otherwise `go run .`
+        binary = os.path.join(bot_dir, "decryptbot")
+        if not os.path.exists(binary):
+            # try any executable binary in root
+            for f in os.listdir(bot_dir):
+                fp = os.path.join(bot_dir, f)
+                if os.path.isfile(fp) and os.access(fp, os.X_OK) and not f.endswith((".go", ".mod", ".sum")):
+                    binary = fp
+                    break
+            else:
+                binary = None
+
+        if binary and os.path.exists(binary):
+            cmd = [binary]
+            type_label = "Go (binary)"
+        else:
+            # Check if go is available
+            go_bin = shutil.which("go")
+            if not go_bin:
+                if not silent:
+                    bot.send_message(
+                        chat_id,
+                        f"❌ Go is not installed on this server and no pre-built binary found for `{bot_name}`.\n"
+                        f"Either install Go or build the binary and upload it.",
+                        parse_mode="Markdown"
+                    )
+                Logger.error(f"Cannot start Go bot '{bot_name}': go not found and no binary")
+                return False
+            cmd = [go_bin, "run", "."]
+            type_label = "Go (go run)"
+
     log_path = os.path.join(bot_dir, "bot.log")
-    # Merge system env with per-bot Variables
+
+    # Environment: system + custom Variables + auto data paths
     bot_env = os.environ.copy()
     custom_env = get_bot_env(bot_name)
     if custom_env:
         bot_env.update(custom_env)
         Logger.info(f"Loaded {len(custom_env)} custom Variable(s) for '{bot_name}': {list(custom_env.keys())}")
-    
-    with open(log_path, 'a', encoding='utf-8') as log_file:
-        process = subprocess.Popen(
-            [VENV_PYTHON, bot_script],
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            cwd=bot_dir,
-            env=bot_env
-        )
-    running_bots[bot_name] = {'process': process, 'start_time': time.time()}
+
+    data_dir = ensure_data_dir(bot_name, bot_dir, bot_env)
+
+    try:
+        with open(log_path, 'a', encoding='utf-8') as log_file:
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                cwd=bot_dir,
+                env=bot_env
+            )
+    except Exception as e:
+        if not silent:
+            bot.send_message(chat_id, f"❌ Failed to start `{bot_name}`: {e}", parse_mode="Markdown")
+        Logger.error(f"Failed to start '{bot_name}': {e}")
+        return False
+
+    running_bots[bot_name] = {'process': process, 'start_time': time.time(), 'type': bot_type}
     if not silent:
         env_note = f"\n🔑 Variables: `{len(custom_env)}` loaded" if custom_env else ""
-        bot.send_message(chat_id, f"✅ Bot `{bot_name}` started successfully.{env_note}", parse_mode="Markdown")
-    Logger.success(f"Bot '{bot_name}' started with PID: {process.pid}" + (f" (vars: {list(custom_env.keys())})" if custom_env else ""))
+        data_note = f"\n📁 DATA_DIR: `{data_dir}`"
+        bot.send_message(
+            chat_id,
+            f"✅ Bot `{bot_name}` started successfully.\n"
+            f"📦 Type: `{type_label}` | PID: `{process.pid}`{env_note}{data_note}",
+            parse_mode="Markdown"
+        )
+    Logger.success(
+        f"Bot '{bot_name}' started ({type_label}) PID={process.pid}"
+        + (f" vars={list(custom_env.keys())}" if custom_env else "")
+        + f" data={data_dir}"
+    )
     return True
 
 def stop_bot(bot_name, chat_id, silent=False):
@@ -494,26 +612,30 @@ def handle_text_input(message):
                 bot.edit_message_text(f"❌ Clone failed:\n\n```\n{error_msg[:1500]}\n```", chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard())
                 return
             
-            bot_py = os.path.join(new_bot_dir, "bot.py")
-            if not os.path.exists(bot_py):
-                possible = ["main.py", "app.py", "run.py", "bot/main.py"]
-                found = None
-                for p in possible:
-                    if os.path.exists(os.path.join(new_bot_dir, p)):
-                        found = p
-                        break
-                if found:
-                    bot.edit_message_text(
-                        f"✅ Repository cloned successfully!\n\n⚠️ `bot.py` not found. Found `{found}` instead.\nYou may need to rename it to `bot.py` or edit the start logic.",
-                        chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard()
-                    )
-                else:
-                    bot.edit_message_text(
-                        f"✅ Repository cloned successfully!\n\n⚠️ No `bot.py` found in the root. Please check the files and rename the main script to `bot.py`.",
-                        chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard()
-                    )
+            btype = detect_bot_type(new_bot_dir)
+            if btype == "go":
+                bot.edit_message_text(
+                    f"✅ Go bot `{bot_name}` cloned successfully!\n\n"
+                    f"🔵 Detected as **Go** project (`go.mod` / `main.go`).\n"
+                    f"📁 Data will be stored in `bots/{bot_name}/data/`\n"
+                    f"🔑 Set Variables (BOT_TOKEN, ADMIN_IDS, ...) before starting.",
+                    chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard()
+                )
+            elif btype == "python":
+                entry = find_python_entry(new_bot_dir)
+                entry_name = os.path.basename(entry) if entry else "?"
+                bot.edit_message_text(
+                    f"✅ Python bot `{bot_name}` cloned successfully!\n\n"
+                    f"🐍 Entry point: `{entry_name}`",
+                    chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard()
+                )
             else:
-                bot.edit_message_text(f"✅ Bot `{bot_name}` created successfully from GitHub!", chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+                bot.edit_message_text(
+                    f"✅ Repository cloned into `{bot_name}`.\n\n"
+                    f"⚠️ Could not detect Python or Go entry point.\n"
+                    f"Make sure you have `bot.py`/`main.py` or `main.go`/`go.mod`.",
+                    chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard()
+                )
                 
             Logger.success(f"Bot '{bot_name}' cloned from {github_url}")
             
@@ -908,12 +1030,26 @@ def callback_handler(call):
             get_system_stats(chat_id, message_id)
 
         elif action == "bot":
+            bot_dir = os.path.join(BOTS_DIR, param)
+            btype = detect_bot_type(bot_dir) or "unknown"
+            type_emoji = "🐍" if btype == "python" else ("🔵" if btype == "go" else "❓")
             status_text = f"Stopped 🔴"
             if param in running_bots and running_bots[param]['process'].poll() is None:
                 pid = running_bots[param]['process'].pid
                 uptime = str(datetime.timedelta(seconds=int(time.time() - running_bots[param]['start_time'])))
                 status_text = f"Running 🟢\n*PID:* `{pid}`\n*Uptime:* `{uptime}`"
-            bot.edit_message_text(f"Managing Bot: `{param}`\n\n*Status:* {status_text}", chat_id, message_id, reply_markup=bot_menu_keyboard(param), parse_mode="Markdown")
+            env = get_bot_env(param)
+            env_line = f"\n🔑 *Variables:* `{len(env)}` set" if env else "\n🔑 *Variables:* none"
+            data_dir = os.path.join(bot_dir, "data")
+            data_line = f"\n📁 *DATA_DIR:* `{data_dir}`" if os.path.isdir(data_dir) else ""
+            bot.edit_message_text(
+                f"Managing Bot: `{param}`\n\n"
+                f"*Type:* {type_emoji} `{btype}`\n"
+                f"*Status:* {status_text}{env_line}{data_line}",
+                chat_id, message_id,
+                reply_markup=bot_menu_keyboard(param),
+                parse_mode="Markdown"
+            )
 
         elif action == "start":
             Logger.info(f"Starting bot '{param}' requested by {chat_id}")
