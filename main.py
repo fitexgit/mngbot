@@ -9,6 +9,7 @@ import telebot
 import zipfile
 import base64
 import threading
+import json
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- Initial Setup and Configuration ---
@@ -142,6 +143,7 @@ def bot_menu_keyboard(bot_name):
         InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{bot_name}"),
         InlineKeyboardButton(watchdog_text, callback_data=f"watchdog_{bot_name}"),
         InlineKeyboardButton("💾 Backup", callback_data=f"backup_{bot_name}"),
+        InlineKeyboardButton("🔑 Variables", callback_data=f"vars_{bot_name}"),
         InlineKeyboardButton("🧹 Clear Log", callback_data=f"clearlog_{bot_name}"),
         InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{bot_name}")
     )
@@ -168,6 +170,30 @@ def get_bots_list():
     if not os.path.exists(BOTS_DIR): os.makedirs(BOTS_DIR)
     return sorted([d for d in os.listdir(BOTS_DIR) if os.path.isdir(os.path.join(BOTS_DIR, d))])
 
+
+def get_bot_env(bot_name):
+    """Load per-bot environment variables from env.json"""
+    env_path = os.path.join(BOTS_DIR, bot_name, "env.json")
+    if not os.path.exists(env_path):
+        return {}
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        Logger.warning(f"Failed to load env.json for '{bot_name}': {e}")
+        return {}
+
+def save_bot_env(bot_name, env_dict):
+    """Save per-bot environment variables to env.json"""
+    env_path = os.path.join(BOTS_DIR, bot_name, "env.json")
+    try:
+        with open(env_path, "w", encoding="utf-8") as f:
+            json.dump(env_dict, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        Logger.error(f"Failed to save env.json for '{bot_name}': {e}")
+        return False
+
 def start_bot(bot_name, chat_id, silent=False):
     if bot_name in running_bots and running_bots[bot_name]['process'].poll() is None:
         if not silent: bot.send_message(chat_id, f"⚠️ Bot `{bot_name}` is already running.", parse_mode="Markdown")
@@ -178,11 +204,26 @@ def start_bot(bot_name, chat_id, silent=False):
         if not silent: bot.send_message(chat_id, f"❌ Error: `bot.py` not found for bot `{bot_name}`.", parse_mode="Markdown")
         return False
     log_path = os.path.join(bot_dir, "bot.log")
+    # Merge system env with per-bot Variables
+    bot_env = os.environ.copy()
+    custom_env = get_bot_env(bot_name)
+    if custom_env:
+        bot_env.update(custom_env)
+        Logger.info(f"Loaded {len(custom_env)} custom Variable(s) for '{bot_name}': {list(custom_env.keys())}")
+    
     with open(log_path, 'a', encoding='utf-8') as log_file:
-        process = subprocess.Popen([VENV_PYTHON, bot_script], stdout=log_file, stderr=subprocess.STDOUT, cwd=bot_dir)
+        process = subprocess.Popen(
+            [VENV_PYTHON, bot_script],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            cwd=bot_dir,
+            env=bot_env
+        )
     running_bots[bot_name] = {'process': process, 'start_time': time.time()}
-    if not silent: bot.send_message(chat_id, f"✅ Bot `{bot_name}` started successfully.", parse_mode="Markdown")
-    Logger.success(f"Bot '{bot_name}' started with PID: {process.pid}")
+    if not silent:
+        env_note = f"\n🔑 Variables: `{len(custom_env)}` loaded" if custom_env else ""
+        bot.send_message(chat_id, f"✅ Bot `{bot_name}` started successfully.{env_note}", parse_mode="Markdown")
+    Logger.success(f"Bot '{bot_name}' started with PID: {process.pid}" + (f" (vars: {list(custom_env.keys())})" if custom_env else ""))
     return True
 
 def stop_bot(bot_name, chat_id, silent=False):
@@ -300,51 +341,69 @@ def get_system_stats(chat_id, message_id):
 
 def backup_bot(bot_name, chat_id):
     bot_folder = os.path.join(BOTS_DIR, bot_name)
+    if not os.path.isdir(bot_folder):
+        bot.send_message(chat_id, f"❌ Bot folder `{bot_name}` not found.", parse_mode="Markdown")
+        Logger.error(f"Backup failed: folder not found for '{bot_name}'")
+        return
+
     req_path = os.path.join(bot_folder, "requirements_backup.txt")
     try:
         result = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True, encoding='utf-8')
         with open(req_path, 'w', encoding='utf-8') as f:
             f.write(result)
+        Logger.info(f"Generated requirements_backup.txt for '{bot_name}'")
     except Exception as e:
-        Logger.warning(f"Could not generate requirements for backup: {e}")
+        Logger.warning(f"Could not generate requirements for backup of '{bot_name}': {e}")
     
-    backup_path = shutil.make_archive(f"{bot_name}_backup", 'zip', bot_folder)
-    
-    if os.path.exists(req_path):
-        try:
-            os.remove(req_path)
-        except:
-            pass
-            
-    with open(backup_path, 'rb') as doc:
-        bot.send_document(chat_id, doc, caption=f"📦 Complete backup for bot `{bot_name}` (includes requirements_backup.txt).", parse_mode="Markdown")
-    os.remove(backup_path)
+    try:
+        backup_path = shutil.make_archive(f"{bot_name}_backup", 'zip', bot_folder)
+        with open(backup_path, 'rb') as doc:
+            bot.send_document(chat_id, doc, caption=f"📦 Complete backup for bot `{bot_name}` (includes requirements_backup.txt).", parse_mode="Markdown")
+        os.remove(backup_path)
+        Logger.success(f"Backup created and sent for '{bot_name}'")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Backup failed for `{bot_name}`: {e}", parse_mode="Markdown")
+        Logger.error(f"Backup failed for '{bot_name}': {e}")
+    finally:
+        if os.path.exists(req_path):
+            try:
+                os.remove(req_path)
+            except:
+                pass
 
 def backup_all_bots(chat_id):
-    if not get_bots_list():
-        bot.send_message(chat_id, "No bots found to back up.")
+    bots = get_bots_list()
+    if not bots:
+        bot.send_message(chat_id, "📭 No bots found to back up.")
+        Logger.info("Backup all skipped: no bots found")
         return
+
+    Logger.info(f"Starting full backup of {len(bots)} bot(s)...")
     global_req = os.path.join(BOTS_DIR, "global_requirements_backup.txt")
     try:
         result = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True, encoding='utf-8')
         with open(global_req, 'w', encoding='utf-8') as f:
             f.write(result)
+        Logger.info("Generated global_requirements_backup.txt")
     except Exception as e:
         Logger.warning(f"Could not generate global requirements: {e}")
         
-    backup_base_name = f"all_bots_backup_{int(time.time())}"
-    backup_path = shutil.make_archive(backup_base_name, 'zip', root_dir=BOTS_DIR)
-    
-    if os.path.exists(global_req):
-        try:
-            os.remove(global_req)
-        except:
-            pass
-            
-    with open(backup_path, 'rb') as doc:
-        bot.send_document(chat_id, doc, caption="📦 Full backup of all bots + global requirements created.")
-    os.remove(backup_path)
-    Logger.success("Full backup created and sent.")
+    try:
+        backup_base_name = f"all_bots_backup_{int(time.time())}"
+        backup_path = shutil.make_archive(backup_base_name, 'zip', root_dir=BOTS_DIR)
+        with open(backup_path, 'rb') as doc:
+            bot.send_document(chat_id, doc, caption=f"📦 Full backup of {len(bots)} bot(s) + global requirements created.")
+        os.remove(backup_path)
+        Logger.success(f"Full backup created and sent ({len(bots)} bots)")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Full backup failed: {e}")
+        Logger.error(f"Full backup failed: {e}")
+    finally:
+        if os.path.exists(global_req):
+            try:
+                os.remove(global_req)
+            except:
+                pass
 
 # --- Watchdog ---
 def monitor_bots():
@@ -522,6 +581,50 @@ def handle_text_input(message):
         except Exception as e:
             bot.edit_message_text(f"❌ **Error:**\n\n`{e}`", chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
+
+    elif action == 'set_bot_vars':
+        bot_name = state['bot_name']
+        del user_states[chat_id]
+        text = message.text.strip()
+        
+        if text.upper() == "CLEAR":
+            save_bot_env(bot_name, {})
+            bot.send_message(chat_id, f"✅ All variables cleared for `{bot_name}`.", parse_mode="Markdown", reply_markup=bot_menu_keyboard(bot_name))
+            Logger.info(f"Cleared all variables for '{bot_name}'")
+            return
+        
+        env = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                bot.send_message(chat_id, f"❌ Invalid line (missing `=`): `{line}`\n\nUse format: `KEY=value`", parse_mode="Markdown")
+                return
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if key:
+                env[key] = value
+        
+        if not env:
+            bot.send_message(chat_id, "❌ No valid variables found.", reply_markup=bot_menu_keyboard(bot_name))
+            return
+        
+        # Merge with existing
+        existing = get_bot_env(bot_name)
+        existing.update(env)
+        save_bot_env(bot_name, existing)
+        
+        lines = [f"`{k}` = `{v}`" for k, v in existing.items()]
+        bot.send_message(
+            chat_id,
+            f"✅ Variables saved for `{bot_name}`:\n\n" + "\n".join(lines) + "\n\n⚠️ Restart the bot for changes to take effect.",
+            parse_mode="Markdown",
+            reply_markup=bot_menu_keyboard(bot_name)
+        )
+        Logger.success(f"Updated variables for '{bot_name}': {list(existing.keys())}")
+
     elif action == 'edit_file':
         file_path = state['file_path']
         bot_name = state['bot_name']
@@ -698,21 +801,112 @@ def callback_handler(call):
         callback_handler(call)
         return
 
+    # ========== EXACT TOOL ACTIONS (must be before split) ==========
+    # These callbacks contain underscores and would be mis-parsed by split("_")
+    exact_tools = {
+        "main_menu": "main",
+        "create_bot": "create_bot",
+        "create_bot_github": "create_bot_github",
+        "restore_backup": "restore_backup",
+        "install_package": "install_package",
+        "install_popular": "install_popular",
+        "list_packages": "list_packages",
+        "run_command": "run_command",
+        "backup_all": "backup_all",
+        "system_stats": "system_stats",
+    }
+
+    if call.data in exact_tools or call.data in ("main_menu", "tools"):
+        bot.answer_callback_query(call.id)
+        try:
+            if call.data == "main_menu" or call.data == "main":
+                bot.edit_message_text("Main Menu:", chat_id, message_id, reply_markup=main_menu_keyboard())
+                return
+            if call.data == "tools":
+                bot.edit_message_text("Tools:", chat_id, message_id, reply_markup=tools_menu_keyboard())
+                return
+            if call.data == "system_stats":
+                get_system_stats(chat_id, message_id)
+                return
+            if call.data == "create_bot":
+                user_states[chat_id] = {'action': 'create_bot'}
+                bot.edit_message_text("Please enter a name for the new bot (letters and numbers only).\n\n💡 Tip: For GitHub repos use the separate «Add Bot from GitHub» button.", chat_id, message_id)
+                Logger.info(f"Admin {chat_id} started create_bot flow")
+                return
+            if call.data == "create_bot_github":
+                user_states[chat_id] = {'action': 'create_bot_github_name'}
+                bot.edit_message_text("Please enter a name for the new bot (letters and numbers only):", chat_id, message_id)
+                Logger.info(f"Admin {chat_id} started create_bot_github flow")
+                return
+            if call.data == "restore_backup":
+                user_states[chat_id] = {'action': 'restore_backup'}
+                bot.edit_message_text("Please upload the `.zip` backup file.", chat_id, message_id)
+                Logger.info(f"Admin {chat_id} started restore_backup flow")
+                return
+            if call.data == "install_package":
+                user_states[chat_id] = {'action': 'install_packages'}
+                bot.edit_message_text("Enter package names to install, separated by spaces (e.g., `pytelegrambotapi requests`):", chat_id, message_id, parse_mode="Markdown")
+                Logger.info(f"Admin {chat_id} started install_package flow")
+                return
+            if call.data == "install_popular":
+                bot.answer_callback_query(call.id, "Installing popular packages... this may take a few minutes.")
+                msg = bot.edit_message_text(f"⭐ Installing {len(POPULAR_PACKAGES)} popular packages...\nThis can take 2-5 minutes. Please wait.", chat_id, message_id)
+                Logger.info(f"Admin {chat_id} started popular packages installation ({len(POPULAR_PACKAGES)} packages)")
+                try:
+                    batch_size = 10
+                    for i in range(0, len(POPULAR_PACKAGES), batch_size):
+                        batch = POPULAR_PACKAGES[i:i+batch_size]
+                        command = [sys.executable, "-m", "pip", "install", "--upgrade"] + batch
+                        result = subprocess.run(command, capture_output=True, text=True, timeout=300, encoding='utf-8')
+                        Logger.info(f"Installed batch {i//batch_size + 1}: {', '.join(batch[:3])}...")
+                    summary = f"✅ Installation finished!\n\nInstalled/Updated ~{len(POPULAR_PACKAGES)} popular packages for Telegram bots, requests, AI, databases, etc."
+                    bot.edit_message_text(summary, chat_id, msg.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back to Tools", callback_data="tools")))
+                    Logger.success("Popular packages installation completed.")
+                except subprocess.TimeoutExpired:
+                    bot.edit_message_text("❌ Installation timed out. Some packages may have been installed. Try again or install manually.", chat_id, msg.message_id, reply_markup=main_menu_keyboard())
+                    Logger.error("Popular packages installation timed out")
+                except Exception as e:
+                    bot.edit_message_text(f"❌ Error during installation:\n`{e}`", chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+                    Logger.error(f"Popular packages installation error: {e}")
+                return
+            if call.data == "list_packages":
+                msg = bot.edit_message_text("🔍 Fetching list of installed packages...", chat_id, message_id)
+                Logger.info(f"Admin {chat_id} requested package list")
+                result = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True, encoding='utf-8')
+                if len(result) > 4000: result = result[:4000] + "\n\n[... output truncated ...]"
+                bot.edit_message_text(f"📦 *Installed Packages:*\n\n```\n{result}\n```", chat_id, msg.message_id, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back to Tools", callback_data="tools")))
+                return
+            if call.data == "run_command":
+                user_states[chat_id] = {'action': 'run_command'}
+                bot.edit_message_text("Enter the shell command to execute:", chat_id, message_id)
+                Logger.info(f"Admin {chat_id} started run_command flow")
+                return
+            if call.data == "backup_all":
+                Logger.info(f"Admin {chat_id} requested full backup of all bots")
+                backup_all_bots(chat_id)
+                return
+        except Exception as e:
+            Logger.error(f"Error handling exact tool action '{call.data}': {e}")
+            bot.answer_callback_query(call.id, "An error occurred.", show_alert=True)
+            return
+
+    # ========== PARAMETERIZED ACTIONS (bot_xxx, start_xxx, etc.) ==========
     parts = call.data.split("_", 2)
     action = parts[0]
     param = parts[1] if len(parts) > 1 else None
     extra_param = parts[2] if len(parts) > 2 else None
 
     bot.answer_callback_query(call.id)
+    Logger.info(f"Callback: action={action} param={param} extra={extra_param} from={chat_id}")
 
     try:
-        if action == "main": 
+        if action == "main":
             bot.edit_message_text("Main Menu:", chat_id, message_id, reply_markup=main_menu_keyboard())
-        elif action == "tools": 
+        elif action == "tools":
             bot.edit_message_text("Tools:", chat_id, message_id, reply_markup=tools_menu_keyboard())
-        elif action == "system": 
+        elif action == "system":
             get_system_stats(chat_id, message_id)
-        
+
         elif action == "bot":
             status_text = f"Stopped 🔴"
             if param in running_bots and running_bots[param]['process'].poll() is None:
@@ -720,26 +914,44 @@ def callback_handler(call):
                 uptime = str(datetime.timedelta(seconds=int(time.time() - running_bots[param]['start_time'])))
                 status_text = f"Running 🟢\n*PID:* `{pid}`\n*Uptime:* `{uptime}`"
             bot.edit_message_text(f"Managing Bot: `{param}`\n\n*Status:* {status_text}", chat_id, message_id, reply_markup=bot_menu_keyboard(param), parse_mode="Markdown")
-        
-        elif action == "start": 
+
+        elif action == "start":
+            Logger.info(f"Starting bot '{param}' requested by {chat_id}")
             start_bot(param, chat_id)
-            bot.answer_callback_query(call.id, f"Start request sent for {param}.")
-        elif action == "stop": 
+        elif action == "stop":
+            Logger.info(f"Stopping bot '{param}' requested by {chat_id}")
             stop_bot(param, chat_id)
-            bot.answer_callback_query(call.id, f"Stop request sent for {param}.")
         elif action == "restart":
-            bot.answer_callback_query(call.id, f"Restarting {param}...")
+            Logger.info(f"Restarting bot '{param}' requested by {chat_id}")
             stop_bot(param, chat_id, silent=True)
             time.sleep(1)
             start_bot(param, chat_id)
-        elif action == "log": 
+        elif action == "log":
             view_log(param, chat_id, message_id)
-        elif action == "stats": 
+        elif action == "stats":
             get_bot_stats(call, param)
-        elif action == "backup": 
+        elif action == "backup":
+            Logger.info(f"Backup requested for bot '{param}' by {chat_id}")
             backup_bot(param, chat_id)
-            bot.answer_callback_query(call.id, "Backup created.")
-        
+
+
+        elif action == "vars":
+            # Show current variables and allow editing
+            env = get_bot_env(param)
+            if env:
+                lines = [f"`{k}` = `{v}`" for k, v in env.items()]
+                text = f"🔑 *Variables for `{param}`:*\n\n" + "\n".join(lines)
+            else:
+                text = f"🔑 *Variables for `{param}`:*\n\n_No variables set yet._"
+            
+            text += "\n\n📝 To set/update variables, send them in this format:\n`KEY1=value1\nKEY2=value2`"
+            text += "\n\nTo clear all variables, send: `CLEAR`"
+            
+            user_states[chat_id] = {'action': 'set_bot_vars', 'bot_name': param}
+            keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back", callback_data=f"bot_{param}"))
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard, parse_mode="Markdown")
+            Logger.info(f"Showing variables for '{param}' to admin {chat_id}")
+
         elif action == "files":
             list_files(call, param)
         elif action == "viewfile":
@@ -750,6 +962,7 @@ def callback_handler(call):
             if os.path.exists(file_path):
                 with open(file_path, 'rb') as doc:
                     bot.send_document(chat_id, doc, caption=f"File `{file_name}` from `{param}`.", parse_mode="Markdown")
+                Logger.info(f"Sent file '{file_name}' from bot '{param}'")
             else:
                 bot.answer_callback_query(call.id, "File not found.", show_alert=True)
         elif action == "deletefile":
@@ -758,9 +971,11 @@ def callback_handler(call):
             try:
                 os.remove(file_path)
                 bot.answer_callback_query(call.id, f"File {file_name} deleted.")
+                Logger.info(f"Deleted file '{file_name}' from bot '{param}'")
                 list_files(call, param)
             except Exception as e:
                 bot.answer_callback_query(call.id, f"Error deleting file: {e}", show_alert=True)
+                Logger.error(f"Failed to delete file '{file_name}': {e}")
         elif action == "editfile":
             file_name = base64.urlsafe_b64decode(extra_param).decode()
             file_path = os.path.join(BOTS_DIR, param, file_name)
@@ -770,59 +985,18 @@ def callback_handler(call):
             user_states[chat_id] = {'action': 'upload_file_to_bot', 'bot_name': param}
             bot.edit_message_text(f"Please upload the file you want to add to `{param}`.", chat_id, message_id, parse_mode="Markdown")
 
-        elif action == "create_bot":
-            user_states[chat_id] = {'action': 'create_bot'}
-            bot.edit_message_text("Please enter a name for the new bot (letters and numbers only).\n\n💡 Tip: For GitHub repos use the separate «Add Bot from GitHub» button.", chat_id, message_id)
-        elif action == "create":
-            if param == "bot" and extra_param == "github":
-                user_states[chat_id] = {'action': 'create_bot_github_name'}
-                bot.edit_message_text("Please enter a name for the new bot (letters and numbers only):", chat_id, message_id)
-        elif action == "restore_backup":
-            user_states[chat_id] = {'action': 'restore_backup'}
-            bot.edit_message_text("Please upload the `.zip` backup file.", chat_id, message_id)
-        elif action == "install_package":
-            user_states[chat_id] = {'action': 'install_packages'}
-            bot.edit_message_text("Enter package names to install, separated by spaces (e.g., `pytelegrambotapi requests`):", chat_id, message_id, parse_mode="Markdown")
-        elif action == "install":
-            if param == "popular":
-                bot.answer_callback_query(call.id, "Installing popular packages... this may take a few minutes.")
-                msg = bot.edit_message_text(f"⭐ Installing {len(POPULAR_PACKAGES)} popular packages...\nThis can take 2-5 minutes. Please wait.", chat_id, message_id)
-                try:
-                    batch_size = 10
-                    for i in range(0, len(POPULAR_PACKAGES), batch_size):
-                        batch = POPULAR_PACKAGES[i:i+batch_size]
-                        command = [sys.executable, "-m", "pip", "install", "--upgrade"] + batch
-                        subprocess.run(command, capture_output=True, text=True, timeout=300, encoding='utf-8')
-                    
-                    summary = f"✅ Installation finished!\n\nInstalled/Updated ~{len(POPULAR_PACKAGES)} popular packages for Telegram bots, requests, AI, databases, etc."
-                    bot.edit_message_text(summary, chat_id, msg.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back to Tools", callback_data="tools")))
-                    Logger.success("Popular packages installation completed.")
-                except subprocess.TimeoutExpired:
-                    bot.edit_message_text("❌ Installation timed out. Some packages may have been installed. Try again or install manually.", chat_id, msg.message_id, reply_markup=main_menu_keyboard())
-                except Exception as e:
-                    bot.edit_message_text(f"❌ Error during installation:\n`{e}`", chat_id, msg.message_id, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-        elif action == "list_packages":
-            msg = bot.edit_message_text("🔍 Fetching list of installed packages...", chat_id, message_id)
-            result = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True, encoding='utf-8')
-            if len(result) > 4000: result = result[:4000] + "\n\n[... output truncated ...]"
-            bot.edit_message_text(f"📦 *Installed Packages:*\n\n```\n{result}\n```", chat_id, msg.message_id, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back to Tools", callback_data="tools")))
-        elif action == "run_command":
-            user_states[chat_id] = {'action': 'run_command'}
-            bot.edit_message_text("Enter the shell command to execute:", chat_id, message_id)
-        elif action == "backup_all":
-            backup_all_bots(chat_id)
-            bot.answer_callback_query(call.id, "Full backup initiated.")
-
         elif action == "rename":
             user_states[chat_id] = {'action': 'rename_bot', 'bot_name': param}
             bot.edit_message_text(f"Enter the new name for bot `{param}`:", chat_id, message_id, parse_mode="Markdown")
         elif action == "watchdog":
-            if param in watchdog_bots: 
+            if param in watchdog_bots:
                 watchdog_bots.discard(param)
                 bot.answer_callback_query(call.id, f"Monitoring for {param} is now OFF.")
-            else: 
+                Logger.info(f"Watchdog OFF for '{param}'")
+            else:
                 watchdog_bots.add(param)
                 bot.answer_callback_query(call.id, f"Monitoring for {param} is now ON.")
+                Logger.info(f"Watchdog ON for '{param}'")
             status_text = f"Stopped 🔴"
             if param in running_bots and running_bots[param]['process'].poll() is None:
                 pid = running_bots[param]['process'].pid
@@ -833,38 +1007,55 @@ def callback_handler(call):
         elif action == "downloadlog":
             log_path = os.path.join(BOTS_DIR, param, "bot.log")
             if os.path.exists(log_path) and os.path.getsize(log_path) > 0:
-                with open(log_path, 'rb') as doc: 
+                with open(log_path, 'rb') as doc:
                     bot.send_document(chat_id, doc, caption=f"Full log for `{param}`.", parse_mode="Markdown")
-            else: 
+                Logger.info(f"Sent full log for '{param}'")
+            else:
                 bot.answer_callback_query(call.id, "Log file is empty or does not exist.", show_alert=True)
-        
+
         elif action == "delete":
-            keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("🗑️ Yes, Delete", callback_data=f"confirmdelete_{param}"), InlineKeyboardButton("↩️ Cancel", callback_data=f"bot_{param}"))
+            keyboard = InlineKeyboardMarkup().add(
+                InlineKeyboardButton("🗑️ Yes, Delete", callback_data=f"confirmdelete_{param}"),
+                InlineKeyboardButton("↩️ Cancel", callback_data=f"bot_{param}")
+            )
             bot.edit_message_text(f"⚠️ Are you sure you want to permanently delete `{param}`?", chat_id, message_id, reply_markup=keyboard, parse_mode="Markdown")
         elif action == "confirmdelete":
+            Logger.warning(f"Deleting bot '{param}' requested by {chat_id}")
             bot.edit_message_text(f"Deleting bot `{param}`...", chat_id, message_id, parse_mode="Markdown")
             delete_bot(param, chat_id)
             call.data = "manage_bots"
             callback_handler(call)
         elif action == "clearlog":
-            keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("🧹 Yes, Clear", callback_data=f"confirmclearlog_{param}"), InlineKeyboardButton("↩️ Cancel", callback_data=f"bot_{param}"))
+            keyboard = InlineKeyboardMarkup().add(
+                InlineKeyboardButton("🧹 Yes, Clear", callback_data=f"confirmclearlog_{param}"),
+                InlineKeyboardButton("↩️ Cancel", callback_data=f"bot_{param}")
+            )
             bot.edit_message_text(f"⚠️ Are you sure you want to clear the log for `{param}`?", chat_id, message_id, reply_markup=keyboard, parse_mode="Markdown")
         elif action == "confirmclearlog":
             log_path = os.path.join(BOTS_DIR, param, "bot.log")
-            if os.path.exists(log_path): open(log_path, 'w').close()
+            if os.path.exists(log_path):
+                open(log_path, 'w').close()
             bot.edit_message_text(f"Log for `{param}` cleared.", chat_id, message_id, reply_markup=bot_menu_keyboard(param), parse_mode="Markdown")
-        elif action == "confirm_reboot":
-            bot.edit_message_text("✅ Server reboot command issued. The manager will go offline.", chat_id, message_id)
-            Logger.warning(f"Reboot command issued by admin {chat_id}.")
-            os.system("sudo reboot")
-            
+            Logger.info(f"Log cleared for '{param}'")
+        elif action == "confirm":
+            if param == "reboot":
+                bot.edit_message_text("✅ Server reboot command issued. The manager will go offline.", chat_id, message_id)
+                Logger.warning(f"Reboot command issued by admin {chat_id}.")
+                os.system("sudo reboot")
+
     except telebot.apihelper.ApiTelegramException as e:
         if 'message is not modified' not in e.description:
             Logger.error(f"API Error on callback '{call.data}': {e}")
-            bot.answer_callback_query(call.id, "An API error occurred.", show_alert=True)
+            try:
+                bot.answer_callback_query(call.id, "An API error occurred.", show_alert=True)
+            except:
+                pass
     except Exception as e:
         Logger.error(f"Generic Error on callback '{call.data}': {e}")
-        bot.answer_callback_query(call.id, "An unexpected error occurred.", show_alert=True)
+        try:
+            bot.answer_callback_query(call.id, "An unexpected error occurred.", show_alert=True)
+        except:
+            pass
 
 
 # --- Main execution block ---
