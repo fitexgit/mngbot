@@ -10,6 +10,7 @@ import zipfile
 import base64
 import threading
 import json
+import tempfile
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- Initial Setup and Configuration ---
@@ -64,8 +65,17 @@ except Exception as e:
 
 # --- Project Paths and Environment ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-BOTS_DIR = os.path.join(BASE_DIR, "bots")
 VENV_PYTHON = sys.executable
+
+# On platforms with a read-only app directory (Pxxl, Railway, etc.) the
+# managed bots must live on a writable path. Prefer BOTS_DIR env, then /tmp.
+# If you later attach a persistent volume, set e.g. BOTS_DIR=/data/bots
+BOTS_DIR = os.getenv("BOTS_DIR", "/tmp/bots")
+try:
+    os.makedirs(BOTS_DIR, exist_ok=True)
+except OSError as e:
+    print(f"❌ ERROR: Cannot create BOTS_DIR at {BOTS_DIR}: {e}")
+    sys.exit(1)
 
 # Popular packages commonly used in Telegram bots (≈50 packages)
 POPULAR_PACKAGES = [
@@ -500,10 +510,11 @@ def backup_bot(bot_name, chat_id):
         Logger.warning(f"Could not generate requirements for backup of '{bot_name}': {e}")
     
     try:
-        backup_path = shutil.make_archive(f"{bot_name}_backup", 'zip', bot_folder)
-        with open(backup_path, 'rb') as doc:
-            bot.send_document(chat_id, doc, caption=f"📦 Complete backup for bot `{bot_name}` (includes requirements_backup.txt).", parse_mode="Markdown")
-        os.remove(backup_path)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backup_base = os.path.join(tmpdir, f"{bot_name}_backup")
+            backup_path = shutil.make_archive(backup_base, 'zip', bot_folder)
+            with open(backup_path, 'rb') as doc:
+                bot.send_document(chat_id, doc, caption=f"📦 Complete backup for bot `{bot_name}` (includes requirements_backup.txt).", parse_mode="Markdown")
         Logger.success(f"Backup created and sent for '{bot_name}'")
     except Exception as e:
         bot.send_message(chat_id, f"❌ Backup failed for `{bot_name}`: {e}", parse_mode="Markdown")
@@ -533,11 +544,11 @@ def backup_all_bots(chat_id):
         Logger.warning(f"Could not generate global requirements: {e}")
         
     try:
-        backup_base_name = f"all_bots_backup_{int(time.time())}"
-        backup_path = shutil.make_archive(backup_base_name, 'zip', root_dir=BOTS_DIR)
-        with open(backup_path, 'rb') as doc:
-            bot.send_document(chat_id, doc, caption=f"📦 Full backup of {len(bots)} bot(s) + global requirements created.")
-        os.remove(backup_path)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backup_base_name = os.path.join(tmpdir, f"all_bots_backup_{int(time.time())}")
+            backup_path = shutil.make_archive(backup_base_name, 'zip', root_dir=BOTS_DIR)
+            with open(backup_path, 'rb') as doc:
+                bot.send_document(chat_id, doc, caption=f"📦 Full backup of {len(bots)} bot(s) + global requirements created.")
         Logger.success(f"Full backup created and sent ({len(bots)} bots)")
     except Exception as e:
         bot.send_message(chat_id, f"❌ Full backup failed: {e}")
@@ -874,7 +885,7 @@ def handle_document(message):
         msg = bot.send_message(chat_id, "📥 Downloading and restoring backup...")
         file_info = bot.get_file(message.document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        temp_zip_path = os.path.join(BASE_DIR, file_name)
+        temp_zip_path = os.path.join(tempfile.gettempdir(), file_name)
         with open(temp_zip_path, 'wb') as new_file: new_file.write(downloaded_file)
         process_zip(temp_zip_path, BOTS_DIR)
         bot.edit_message_text("✅ Backup successfully restored.", chat_id, msg.message_id, reply_markup=main_menu_keyboard())
@@ -1304,6 +1315,7 @@ def callback_handler(call):
 # --- Main execution block ---
 if __name__ == "__main__":
     Logger.info("Starting bot manager...")
+    Logger.info(f"BOTS_DIR = {BOTS_DIR}")
     if "VIRTUAL_ENV" not in os.environ:
          Logger.warning("No active virtual environment detected. This may cause dependency issues.")
     else:
