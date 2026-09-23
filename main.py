@@ -67,15 +67,37 @@ except Exception as e:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VENV_PYTHON = sys.executable
 
-# On platforms with a read-only app directory (Pxxl, Railway, etc.) the
-# managed bots must live on a writable path. Prefer BOTS_DIR env, then /tmp.
-# If you later attach a persistent volume, set e.g. BOTS_DIR=/data/bots
-BOTS_DIR = os.getenv("BOTS_DIR", "/tmp/bots")
-try:
-    os.makedirs(BOTS_DIR, exist_ok=True)
-except OSError as e:
-    print(f"❌ ERROR: Cannot create BOTS_DIR at {BOTS_DIR}: {e}")
-    sys.exit(1)
+# Writable data path for managed bots (Pxxl / Railway / Docker often have
+# a read-only app tree). Priority:
+#   1) BOTS_DIR env (e.g. /data/bots when a volume is mounted)
+#   2) /data/bots  (common volume mount)
+#   3) /tmp/bots   (always writable, lost on restart)
+#   4) ./bots next to the script (local dev)
+def _resolve_bots_dir():
+    candidates = []
+    env_dir = os.getenv("BOTS_DIR")
+    if env_dir:
+        candidates.append(env_dir)
+    candidates.extend([
+        "/data/bots",
+        "/tmp/bots",
+        os.path.join(BASE_DIR, "bots"),
+    ])
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+            test_file = os.path.join(path, ".write_test")
+            with open(test_file, "w") as f:
+                f.write("ok")
+            os.remove(test_file)
+            return path
+        except OSError:
+            continue
+    fallback = "/tmp/bots"
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+BOTS_DIR = _resolve_bots_dir()
 
 # Popular packages commonly used in Telegram bots (≈50 packages)
 POPULAR_PACKAGES = [
